@@ -335,3 +335,4 @@ client.logout()
 | *Subscribe*            | [**neo_api_client.subscribe**](docs/webSocket.md#websocket)                                | Subscribe                |
 | *Subscribe Order Feed* | [**neo_api_client.subscribeorderfeed**](docs/webSocket_orderfeed.md#websocket_orderfeed)   | Subscribe                |
 
+# kotek-neo-bot
