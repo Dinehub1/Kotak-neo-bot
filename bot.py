@@ -1,153 +1,124 @@
-import os
 import time
-import pandas as pd
-from dotenv import load_dotenv
-from neo_api_client import NeoAPI
+import logging
+from datetime import datetime
+
+import config
+from broker import KotakBroker
+from data_engine import DataEngine
 from strategy import apply_swing_trend_strategy
 
-# ==========================================
-# BOT CONFIGURATION
-# ==========================================
-# Change these variables based on your preference
-TRADING_SYMBOL = "NIFTY-I"       # The instrument you want to trade
-EXCHANGE_SEGMENT = "nse_fo"      # e.g., 'nse_cm' for cash, 'nse_fo' for futures
-QUANTITY = 25                    # Quantity per trade
-ORDER_TYPE = "MKT"               # Market order ('MKT') or Limit ('L')
-PRODUCT_TYPE = "MIS"             # 'MIS' (Intraday) or 'NRML' (Delivery)
-TIMEFRAME_MINUTES = 5            # Interval for building candles (e.g., 5 min)
-# ==========================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-load_dotenv()
-CONSUMER_KEY = os.getenv("NEO_CONSUMER_KEY")
-MOBILE_NUMBER = os.getenv("NEO_MOBILE_NUMBER")
-UCC = os.getenv("NEO_UCC")
-MPIN = os.getenv("NEO_MPIN")
-
-# State management
-current_position = 0  # 0: Flat, >0: Long, <0: Short
-historical_data = []  # Will hold historical OHLC candles
-
-def login():
-    print("Initializing Kotak Neo Client...")
-    client = NeoAPI(
-        environment='prod',
-        access_token=None,
-        neo_fin_key=None,
-        consumer_key=CONSUMER_KEY
-    )
-    
-    totp_code = input(f"\n🔑 Enter current 6-digit TOTP code for {UCC}: ").strip()
-    
-    print("\nStarting TOTP Login...")
-    client.totp_login(mobile_number=MOBILE_NUMBER, ucc=UCC, totp=totp_code)
-    
-    print("Validating MPIN...")
-    client.totp_validate(mpin=MPIN)
-    
-    print("🎉 Successfully authenticated!")
-    return client
-
-def place_order(client, transaction_type, qty):
-    print(f"📝 Placing {transaction_type} order for {qty} of {TRADING_SYMBOL}")
-    try:
-        # Note: Depending on whether you need a specific instrument token, you might
-        # need to search for the scrip first.
-        resp = client.place_order(
-            exchange_segment=EXCHANGE_SEGMENT,
-            product=PRODUCT_TYPE,
-            price="0", # Market order
-            order_type=ORDER_TYPE,
-            quantity=str(qty),
-            validity="DAY",
-            trading_symbol=TRADING_SYMBOL,
-            transaction_type=transaction_type,
-            amo="NO",
-            disclosed_quantity="0",
-            market_protection="0",
-            pf="N",
-            trigger_price="0"
-        )
-        print(f"✅ Order Response: {resp}")
-        return True
-    except Exception as e:
-        print(f"❌ Error placing order: {e}")
-        return False
-
-def on_signal(client, signal_type):
-    global current_position
+def on_signal(broker, current_position, signal_type):
+    """
+    Executes trades based on the signal and current position.
+    Returns the new assumed position.
+    """
+    new_position = current_position
+    qty = config.QUANTITY
     
     if signal_type == "BUY":
         if current_position < 0:
-            print("🔄 Closing Short Position...")
-            place_order(client, "B", QUANTITY)
-            current_position = 0
-            
-        if current_position == 0:
-            print("📈 Opening Long Position...")
-            place_order(client, "B", QUANTITY)
-            current_position = QUANTITY
-            
+            logger.info("🔄 Closing Short Position...")
+            success, _ = broker.place_order("B", qty)
+            if success:
+                new_position = 0
+                time.sleep(1) # Brief pause before opening new position
+            else:
+                return new_position
+                
+        if new_position == 0:
+            logger.info("📈 Opening Long Position...")
+            success, _ = broker.place_order("B", qty)
+            if success:
+                new_position = qty
+                
     elif signal_type == "SELL":
         if current_position > 0:
-            print("🔄 Closing Long Position...")
-            place_order(client, "S", QUANTITY)
-            current_position = 0
-            
-        if current_position == 0:
-            print("📉 Opening Short Position...")
-            place_order(client, "S", QUANTITY)
-            current_position = -QUANTITY
-
-def on_message(message):
-    """
-    Callback for live websocket data. 
-    Here you would aggregate tick data into candles based on TIMEFRAME_MINUTES.
-    For demonstration, we print the incoming message.
-    """
-    # print(f"Live Data: {message}")
-    pass
-
-def on_error(error_message):
-    print(f"WebSocket Error: {error_message}")
+            logger.info("🔄 Closing Long Position...")
+            success, _ = broker.place_order("S", qty)
+            if success:
+                new_position = 0
+                time.sleep(1) # Brief pause before opening new position
+            else:
+                return new_position
+                
+        if new_position == 0:
+            logger.info("📉 Opening Short Position...")
+            success, _ = broker.place_order("S", qty)
+            if success:
+                new_position = -qty
+                
+    return new_position
 
 def main():
-    if not all([CONSUMER_KEY, MOBILE_NUMBER, UCC, MPIN]):
-        print("❌ Missing credentials in .env file")
+    logger.info("🚀 Starting Native Python Trading Bot...")
+    
+    # Initialize broker and login
+    broker = KotakBroker()
+    try:
+        broker.login()
+    except Exception as e:
+        logger.error(f"❌ Login failed: {e}")
         return
+
+    # Sync position
+    current_position = broker.get_current_position()
+    if current_position is None:
+        logger.warning("⚠️ Could not fetch actual position. Defaulting to 0.")
+        current_position = 0
         
-    client = login()
+    logger.info(f"📌 Starting position for {config.TRADING_SYMBOL}: {current_position}")
+
+    # Initialize data engine
+    engine = DataEngine(symbol=config.TRADING_SYMBOL, timeframe_minutes=config.TIMEFRAME_MINUTES)
     
-    # Optional: Setup Websocket
-    client.on_message = on_message
-    client.on_error = on_error
-    
-    # You would normally subscribe to your specific instrument token here:
-    # client.subscribe(instrument_tokens=[{"instrument_token": "...", "exchange_segment": EXCHANGE_SEGMENT}])
-    
-    print("\n🚀 Bot is now running. Waiting for data and signals...")
-    print("Press Ctrl+C to stop.")
+    last_processed_candle_time = None
+
+    logger.info(f"⏳ Entering polling loop (Interval: {config.POLL_INTERVAL_SECONDS}s). Press Ctrl+C to stop.")
     
     try:
         while True:
-            # Main strategy loop
-            # 1. Fetch latest data / build latest candle
-            # df = get_latest_data(client)
+            # 1. Fetch latest data
+            df = engine.fetch_ohlc(days=3)
             
-            # 2. Apply strategy
-            # df = apply_swing_trend_strategy(df)
-            
-            # 3. Check latest signal
-            # latest_row = df.iloc[-1]
-            # if latest_row['buy_signal']:
-            #     on_signal(client, "BUY")
-            # elif latest_row['sell_signal']:
-            #     on_signal(client, "SELL")
+            if df is not None and not df.empty:
+                # 2. Apply strategy
+                # Strategy expects 'high', 'low', 'close' columns
+                df = apply_swing_trend_strategy(df, no=3)
                 
-            time.sleep(5) # Avoid spamming loop
+                # 3. Get the latest closed candle
+                # Depending on Yahoo Finance, the absolute last row might be the currently forming candle.
+                # To be safe, signals are usually acted upon when a candle closes.
+                # We will check the last row for signals.
+                latest_row = df.iloc[-1]
+                latest_time = latest_row['datetime']
+                
+                # Check if we have a new signal on a candle we haven't processed yet
+                if last_processed_candle_time is None or latest_time > last_processed_candle_time:
+                    buy_sig = bool(latest_row.get('buy_signal', False))
+                    sell_sig = bool(latest_row.get('sell_signal', False))
+                    
+                    if buy_sig or sell_sig:
+                        logger.info(f"🔔 Signal detected at {latest_time} | Price: {latest_row['close']}")
+                        
+                        if buy_sig:
+                            current_position = on_signal(broker, current_position, "BUY")
+                        elif sell_sig:
+                            current_position = on_signal(broker, current_position, "SELL")
+                            
+                        last_processed_candle_time = latest_time
+            
+            time.sleep(config.POLL_INTERVAL_SECONDS)
             
     except KeyboardInterrupt:
-        print("\n⏹️ Stopping bot and logging out...")
-        client.logout()
+        logger.info("\n⏹️ Stopping bot...")
+        try:
+            broker.client.logout()
+            logger.info("Logged out successfully.")
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
